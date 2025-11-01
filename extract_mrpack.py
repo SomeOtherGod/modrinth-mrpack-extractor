@@ -10,11 +10,21 @@ import json
 import shutil
 import hashlib
 from pathlib import Path
+import concurrent.futures
+import itertools
+import os
+import time
 
 try:
     import requests
 except Exception:
     requests = None
+
+try:
+    # import tqdm optionally;
+    from tqdm import tqdm as _tqdm
+except Exception:
+    _tqdm = None
 
 CHUNK_SIZE = 8192
 
@@ -70,25 +80,51 @@ def extract_overrides(z: zipfile.ZipFile, overrides_prefix: str, dest: Path):
     return count
 
 
-def download_file(url: str, dest: Path, expected_hashes: dict | None = None):
-    """Download url to dest. If expected_hashes provided (sha1/sha512) verify the file and return True on match."""
+def download_file(url: str, dest: Path, expected_hashes: dict | None = None, position: int | None = None, total_size: int | None = None):
+    """Download url to dest with per-file tqdm progress bar and optional hash verification.
+    Returns True on success; raises on failure.
+    """
     if requests is None:
         raise RuntimeError("requests library is required to download files. Install with: pip install -r requirements.txt")
+    if _tqdm is None:
+        raise RuntimeError("tqdm is required for progress bars. Install with: pip install -r requirements.txt")
 
     dest.parent.mkdir(parents=True, exist_ok=True)
-    with requests.get(url, stream=True, timeout=30) as r:
-        r.raise_for_status()
-        h1 = hashlib.sha1() if expected_hashes and 'sha1' in expected_hashes else None
-        h512 = hashlib.sha512() if expected_hashes and 'sha512' in expected_hashes else None
-        with open(dest, 'wb') as f:
-            for chunk in r.iter_content(chunk_size=CHUNK_SIZE):
-                if not chunk:
-                    continue
-                f.write(chunk)
-                if h1:
-                    h1.update(chunk)
-                if h512:
-                    h512.update(chunk)
+    h1 = hashlib.sha1() if expected_hashes and 'sha1' in expected_hashes else None
+    h512 = hashlib.sha512() if expected_hashes and 'sha512' in expected_hashes else None
+
+    try:
+        with requests.get(url, stream=True, timeout=30) as r:
+            r.raise_for_status()
+            # prefer provided total_size, fallback to Content-Length header (use 0 when missing)
+            try:
+                total = int(total_size) if total_size else int(r.headers.get('Content-Length', 0))
+            except Exception:
+                total = 0
+
+            # create progress bar
+            pbar = _tqdm(total=total, unit='B', unit_scale=True, unit_divisor=1024, desc=dest.name, position=position, leave=False)
+            try:
+                with open(dest, 'wb') as f:
+                    for chunk in r.iter_content(chunk_size=CHUNK_SIZE):
+                        if not chunk:
+                            continue
+                        f.write(chunk)
+                        if h1:
+                            h1.update(chunk)
+                        if h512:
+                            h512.update(chunk)
+                        pbar.update(len(chunk))
+            finally:
+                pbar.close()
+    except Exception:
+        # Clean up partial file
+        try:
+            if dest.exists():
+                dest.unlink()
+        except Exception:
+            pass
+        raise
 
     # verify
     if expected_hashes:
@@ -164,25 +200,57 @@ def process_mrpack(mrpack_path: Path, outdir: Path | None = None, verify_hashes:
                 print('No files to download after applying filters.')
                 return
 
-            for idx, entry in enumerate(files_to_download, start=1):
-                path = entry.get('path')
-                if not path:
-                    print(f'[{idx}/{total}] Skipping file entry without path')
-                    continue
-                downloads = entry.get('downloads') or []
-                if isinstance(downloads, str):
-                    downloads = [downloads]
-                if not downloads:
-                    print(f'[{idx}/{total}] No download URL for {path}; skipping')
-                    continue
-                url = downloads[0]
-                dest = outdir.joinpath(path)
-                print(f'[{idx}/{total}] Downloading {url} -> {dest}')
-                expected_hashes = entry.get('hashes') if verify_hashes else None
-                try:
-                    download_file(url, dest, expected_hashes)
-                except Exception as e:
-                    print(f'[{idx}/{total}] Failed to download {url}: {e}')
+            # Prepare parallel downloads
+            max_workers = min(8, (os.cpu_count() or 4) * 2)
+            position_counter = itertools.count(0)
+
+            futures = {}
+            scheduled = 0
+            succeeded = 0
+            failed = 0
+            start_time = None
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
+                # start timer when we begin scheduling downloads
+                start_time = time.perf_counter()
+                for idx, entry in enumerate(files_to_download, start=1):
+                    path = entry.get('path')
+                    if not path:
+                        print(f'[{idx}/{total}] Skipping file entry without path')
+                        continue
+                    downloads = entry.get('downloads') or []
+                    if isinstance(downloads, str):
+                        downloads = [downloads]
+                    if not downloads:
+                        print(f'[{idx}/{total}] No download URL for {path}; skipping')
+                        continue
+                    url = downloads[0]
+                    dest = outdir.joinpath(path)
+                    expected_hashes = entry.get('hashes') if verify_hashes else None
+                    size = entry.get('fileSize') or None
+                    position = next(position_counter)
+                    print(f'[{idx}/{total}] Scheduling {url} -> {dest}')
+                    fut = ex.submit(download_file, url, dest, expected_hashes, position, size)
+                    futures[fut] = (idx, total, path, url, dest)
+                    scheduled += 1
+
+                # Wait for downloads to complete and report results
+                for fut in concurrent.futures.as_completed(futures):
+                    idx, total, path, url, dest = futures[fut]
+                    try:
+                        fut.result()
+                    except Exception as e:
+                        failed += 1
+                        print(f'[{idx}/{total}] Failed to download {url}: {e}')
+                    else:
+                        succeeded += 1
+            # end with ThreadPoolExecutor
+            end_time = time.perf_counter() if start_time is not None else None
+            # Print summary of downloads
+            if start_time is not None:
+                elapsed = end_time - start_time
+                print(f"Downloaded {succeeded}/{scheduled} files in {elapsed:.2f}s")
+            else:
+                print(f"No downloads were scheduled.")
     except zipfile.BadZipFile:
         raise RuntimeError(f"File is not a valid zip archive: {mrpack_path}")
 
